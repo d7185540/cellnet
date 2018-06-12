@@ -17,11 +17,11 @@ type tcpConnector struct {
 	peer.CoreProcBundle
 	peer.CoreTCPSocketOption
 
-	defaultSes cellnet.Session
+	defaultSes *tcpSession
 
 	tryConnTimes int // 尝试连接次数
 
-	endSignal sync.WaitGroup
+	sesEndSignal sync.WaitGroup
 
 	reconDur time.Duration
 }
@@ -58,9 +58,8 @@ func (self *tcpConnector) Stop() {
 
 	self.StartStopping()
 
-	if self.defaultSes != nil {
-		self.defaultSes.Close()
-	}
+	// 通知发送关闭
+	self.defaultSes.Close()
 
 	// 等待线程结束
 	self.WaitStopFinished()
@@ -89,10 +88,7 @@ func (self *tcpConnector) connect(address string) {
 		// 尝试用Socket连接地址
 		conn, err := net.Dial("tcp", address)
 
-		ses := newSession(conn, self, func() {
-			self.endSignal.Done()
-		})
-		self.defaultSes = ses
+		self.defaultSes.conn = conn
 
 		// 发生错误时退出
 		if err != nil {
@@ -108,9 +104,9 @@ func (self *tcpConnector) connect(address string) {
 			// 没重连就退出
 			if self.ReconnectDuration() == 0 {
 
-				log.Debugf("#tcp.connect failed(%s)@%d address: %s", self.Name(), ses.ID(), self.Address())
+				log.Debugf("#tcp.connect failed(%s)@%d address: %s", self.Name(), self.defaultSes.ID(), self.Address())
 
-				self.PostEvent(&cellnet.RecvMsgEvent{ses, &cellnet.SessionConnectError{}})
+				self.PostEvent(&cellnet.RecvMsgEvent{self.defaultSes, &cellnet.SessionConnectError{}})
 				break
 			}
 
@@ -121,21 +117,19 @@ func (self *tcpConnector) connect(address string) {
 			continue
 		}
 
-		self.endSignal.Add(1)
+		self.sesEndSignal.Add(1)
 
 		self.ApplySocketOption(conn)
 
-		ses.(interface {
-			Start()
-		}).Start()
+		self.defaultSes.Start()
 
 		self.tryConnTimes = 0
 
-		self.PostEvent(&cellnet.RecvMsgEvent{ses, &cellnet.SessionConnected{}})
+		self.PostEvent(&cellnet.RecvMsgEvent{self.defaultSes, &cellnet.SessionConnected{}})
 
-		self.endSignal.Wait()
+		self.sesEndSignal.Wait()
 
-		self.defaultSes = nil
+		self.defaultSes.conn = nil
 
 		// 没重连就退出/主动退出
 		if self.IsStopping() || self.ReconnectDuration() == 0 {
@@ -167,12 +161,16 @@ func (self *tcpConnector) TypeName() string {
 func init() {
 
 	peer.RegisterPeerCreator(func() cellnet.Peer {
-		p := &tcpConnector{
+		self := &tcpConnector{
 			SessionManager: new(peer.CoreSessionManager),
 		}
 
-		p.CoreTCPSocketOption.Init()
+		self.defaultSes = newSession(nil, self, func() {
+			self.sesEndSignal.Done()
+		})
 
-		return p
+		self.CoreTCPSocketOption.Init()
+
+		return self
 	})
 }
